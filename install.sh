@@ -11,7 +11,7 @@ BIN_DIR="$HOME/.local/bin"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║            transcribe — installer for macOS ARM             ║"
+echo "║            transcribe — installer for macOS ARM              ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -59,14 +59,12 @@ source "$INSTALL_DIR/venv/bin/activate"
 echo "  Upgrading pip…"
 pip install --upgrade pip --quiet
 
-# ── Install core dependencies ─────────────────────────────────────────────── #
+# ── Install whisply with MLX support ──────────────────────────────────────── #
 
 echo ""
-echo "Installing mlx-whisper (this downloads ~3 GB of model weights on first run)…"
-pip install mlx-whisper --quiet
-
-echo "Installing pyannote.audio + torch (for --speakerid support)…"
-pip install pyannote.audio --quiet
+echo "Installing whisply with MLX support…"
+pip install whisply --quiet
+pip install "whisply[mlx]" --quiet
 
 # huggingface-cli for token management
 pip install huggingface_hub[cli] --quiet
@@ -93,26 +91,22 @@ echo "✓ Installed:  $BIN_DIR/transcribe"
 
 # ── PATH setup ─────────────────────────────────────────────────────────────── #
 
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-    ZSHRC="$HOME/.zshrc"
-    # Only append if the line isn't already in .zshrc
-    if ! grep -qF '/.local/bin' "$ZSHRC" 2>/dev/null; then
-        echo "" >> "$ZSHRC"
-        echo '# Added by transcribe installer' >> "$ZSHRC"
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$ZSHRC"
-        echo "✓ Added ~/.local/bin to PATH in ~/.zshrc"
-    fi
-    export PATH="$BIN_DIR:$PATH"
+ZSHRC="$HOME/.zshrc"
+if ! grep -qF '/.local/bin' "$ZSHRC" 2>/dev/null; then
+    echo "" >> "$ZSHRC"
+    echo '# Added by transcribe installer' >> "$ZSHRC"
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$ZSHRC"
+    echo "✓ Added ~/.local/bin to PATH in ~/.zshrc"
 fi
 
-# ── Speaker diarization setup reminder ────────────────────────────────────── #
+# ── Speaker annotation setup reminder ─────────────────────────────────────── #
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  SETUP FOR --speakerid  (one-time, skip if you don't need it)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "  Speaker diarization uses pyannote.audio, which requires a"
+echo "  Speaker annotation uses pyannote.audio, which requires a"
 echo "  free HuggingFace account and token:"
 echo ""
 echo "  1. Create an account at https://huggingface.co"
@@ -122,7 +116,7 @@ echo "     → https://huggingface.co/pyannote/segmentation-3.0"
 echo "  3. Create an access token:"
 echo "     → https://huggingface.co/settings/tokens"
 echo "  4. Run:"
-echo "     $INSTALL_DIR/venv/bin/huggingface-cli login"
+echo "     $INSTALL_DIR/venv/bin/hf auth login"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
@@ -133,3 +127,7 @@ echo "  transcribe --turbo recording.m4a      # faster, slightly less accurate"
 echo "  transcribe -o notes.md recording.m4a  # custom output path"
 echo ""
 echo "Done! 🎙️"
+echo ""
+echo "If this is a fresh install, run this or open a new terminal:"
+echo ""
+echo "  source ~/.zshrc"

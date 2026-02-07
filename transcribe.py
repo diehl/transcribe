@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-transcribe — CLI tool for audio transcription on Apple Silicon.
+transcribe — Simple CLI wrapper around whisply for audio-to-Markdown transcription.
 
-Uses mlx-whisper (large-v3) for transcription and pyannote.audio for
-speaker diarization. Outputs Markdown.
+Uses whisply with MLX acceleration on Apple Silicon for fast, on-device
+transcription and speaker diarization.
 
 Usage:
     transcribe recording.m4a
@@ -13,216 +13,177 @@ Usage:
 """
 
 import argparse
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
-MODELS = {
-    "large-v3": "mlx-community/whisper-large-v3-mlx",
-    "turbo": "mlx-community/whisper-large-v3-turbo",
-}
+def find_whisply_output(output_dir: Path, stem: str) -> Path | None:
+    """Find whisply's JSON output file.
+
+    whisply creates: output_dir/<stem>/<stem>.json
+    """
+    candidate = output_dir / stem / f"{stem}.json"
+    if candidate.exists():
+        return candidate
+
+    # Search for any json file in the output directory tree
+    for f in output_dir.rglob("*.json"):
+        return f
+
+    return None
 
 
-def transcribe_audio(audio_path: str, model_key: str = "large-v3", speaker_id: bool = False) -> str:
-    """Transcribe an audio file and return Markdown text."""
-    import mlx_whisper
-
-    model_repo = MODELS[model_key]
-    print(f"Model: {model_repo}")
-    print("Running transcription…")
-
-    result = mlx_whisper.transcribe(
-        audio_path,
-        path_or_hf_repo=model_repo,
-        word_timestamps=speaker_id,
-    )
-
-    if speaker_id:
-        return _format_diarized(audio_path, result)
-    else:
-        return _format_simple(result)
-
-
-# --------------------------------------------------------------------------- #
-#  Simple transcript (no speaker labels)
-# --------------------------------------------------------------------------- #
-
-def _format_simple(result: dict) -> str:
+def json_to_markdown_simple(data: dict) -> str:
+    """Convert whisply JSON output to simple Markdown (no speaker labels)."""
     lines = ["# Transcript", ""]
-    paragraph: list[str] = []
-    last_end = 0.0
 
-    for seg in result.get("segments", []):
-        text = seg["text"].strip()
-        if not text:
-            continue
+    chunks = data.get("chunks", [])
+    if chunks:
+        paragraph: list[str] = []
+        last_end = 0.0
+        sentence_count = 0
 
-        # Break into a new paragraph after a ≥2-second pause
-        if paragraph and seg["start"] - last_end > 2.0:
+        for chunk in chunks:
+            text = chunk.get("text", "").strip()
+            if not text:
+                continue
+
+            ts = chunk.get("timestamp", [0.0, 0.0])
+            start = ts[0] if ts[0] is not None else last_end
+            end = ts[1] if ts[1] is not None else start
+
+            # Count sentences ending in this chunk
+            sentence_count += sum(1 for c in text if c in ".?!")
+
+            # Break into new paragraph after ≥1s pause or after ~5 sentences
+            if paragraph and (start - last_end > 1.0 or sentence_count >= 5):
+                lines.append(" ".join(paragraph))
+                lines.append("")
+                paragraph = []
+                sentence_count = 0
+
+            paragraph.append(text)
+            last_end = end
+
+        if paragraph:
             lines.append(" ".join(paragraph))
             lines.append("")
-            paragraph = []
-
-        paragraph.append(text)
-        last_end = seg["end"]
-
-    if paragraph:
-        lines.append(" ".join(paragraph))
-        lines.append("")
+    else:
+        # Fallback: use top-level text field
+        text = data.get("text", "").strip()
+        if text:
+            lines.append(text)
+            lines.append("")
 
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
-#  Diarized transcript (speaker labels)
-# --------------------------------------------------------------------------- #
+def json_to_markdown_speakers(data: dict) -> str:
+    """Convert whisply annotated JSON output to Markdown with speaker labels."""
+    lines = ["# Transcript", ""]
 
-def _format_diarized(audio_path: str, result: dict) -> str:
-    try:
-        from pyannote.audio import Pipeline
-    except ImportError:
-        print(
-            "Error: pyannote.audio is not installed.\n"
-            "Run:  ~/.local/share/transcribe/venv/bin/pip install pyannote.audio\n"
-            "Then accept the model terms — see install.sh output for details.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    chunks = data.get("chunks", [])
+    if not chunks:
+        text = data.get("text", "").strip()
+        if text:
+            lines.append(text)
+            lines.append("")
+        return "\n".join(lines)
 
-    import torch
-
-    print("Running speaker diarization…")
-
-    try:
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-    except Exception as exc:
-        if "token" in str(exc).lower() or "401" in str(exc) or "gated" in str(exc).lower():
-            print(
-                "Error: HuggingFace authentication required for pyannote models.\n\n"
-                "1. Create a token at https://huggingface.co/settings/tokens\n"
-                "2. Accept terms at https://huggingface.co/pyannote/speaker-diarization-3.1\n"
-                "3. Accept terms at https://huggingface.co/pyannote/segmentation-3.0\n"
-                "4. Run:  huggingface-cli login\n",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        raise
-
-    if torch.backends.mps.is_available():
-        pipeline.to(torch.device("mps"))
-
-    diarization = pipeline(audio_path)
-
-    # Build speaker timeline
-    speaker_segments = [
-        {"start": turn.start, "end": turn.end, "speaker": speaker}
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
-    ]
-
-    # Collect word-level timestamps from whisper result
-    words = []
-    for seg in result.get("segments", []):
-        for w in seg.get("words", []):
-            # mlx-whisper uses "word"; some variants use "text"
-            token = w.get("word", w.get("text", "")).strip()
-            if token:
-                words.append({"start": w["start"], "end": w["end"], "word": token})
-
-    if not words:
-        # Fallback: no word-level timestamps — assign whole segments
-        return _diarize_segment_level(result, speaker_segments)
-
-    # Map each word to the speaker with the most temporal overlap
-    def _find_speaker(w_start: float, w_end: float) -> str:
-        best, best_overlap = "Unknown", 0.0
-        for ss in speaker_segments:
-            overlap = max(0.0, min(w_end, ss["end"]) - max(w_start, ss["start"]))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best = ss["speaker"]
-        return best
-
-    # Group consecutive words by speaker into passages
-    passages: list[dict] = []
-    cur_speaker = None
-    cur_words: list[str] = []
-
-    for w in words:
-        spk = _find_speaker(w["start"], w["end"])
-        if spk != cur_speaker:
-            if cur_words:
-                passages.append({"speaker": cur_speaker, "text": " ".join(cur_words)})
-            cur_speaker = spk
-            cur_words = [w["word"]]
-        else:
-            cur_words.append(w["word"])
-
-    if cur_words:
-        passages.append({"speaker": cur_speaker, "text": " ".join(cur_words)})
-
-    return _render_passages(passages)
-
-
-def _diarize_segment_level(result: dict, speaker_segments: list[dict]) -> str:
-    """Fallback: assign whole whisper segments to speakers (no word timestamps)."""
-    passages: list[dict] = []
-
-    for seg in result.get("segments", []):
-        text = seg["text"].strip()
-        if not text:
-            continue
-        mid = (seg["start"] + seg["end"]) / 2.0
-        best, best_dist = "Unknown", float("inf")
-        for ss in speaker_segments:
-            if ss["start"] <= mid <= ss["end"]:
-                best = ss["speaker"]
-                break
-            dist = min(abs(mid - ss["start"]), abs(mid - ss["end"]))
-            if dist < best_dist:
-                best_dist = dist
-                best = ss["speaker"]
-
-        # Merge with previous passage if same speaker
-        if passages and passages[-1]["speaker"] == best:
-            passages[-1]["text"] += " " + text
-        else:
-            passages.append({"speaker": best, "text": text})
-
-    return _render_passages(passages)
-
-
-def _render_passages(passages: list[dict]) -> str:
-    # Assign friendly names (Speaker 1, Speaker 2, …)
+    # Build speaker-labeled passages by grouping consecutive chunks by speaker
     speaker_map: dict[str, str] = {}
     counter = 1
-    for p in passages:
-        raw = p["speaker"]
-        if raw not in speaker_map and raw != "Unknown":
-            speaker_map[raw] = f"Speaker {counter}"
+    passages: list[dict] = []
+
+    for chunk in chunks:
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+
+        raw_speaker = chunk.get("speaker", None)
+
+        if raw_speaker and raw_speaker not in speaker_map:
+            speaker_map[raw_speaker] = f"Speaker {counter}"
             counter += 1
 
-    lines = ["# Transcript", ""]
+        label = speaker_map.get(raw_speaker, "Unknown") if raw_speaker else None
+
+        # Merge with previous passage if same speaker
+        if passages and passages[-1]["speaker"] == label:
+            passages[-1]["text"] += " " + text
+        else:
+            passages.append({"speaker": label, "text": text})
+
+    if not any(p["speaker"] for p in passages):
+        # No speaker info found — fall back to simple format
+        return json_to_markdown_simple(data)
+
     for p in passages:
-        label = speaker_map.get(p["speaker"], p["speaker"])
+        label = p["speaker"] or "Unknown"
         lines.append(f"**{label}:** {p['text']}")
         lines.append("")
 
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
-#  CLI
-# --------------------------------------------------------------------------- #
+def run_whisply(
+    audio_path: Path,
+    output_dir: Path,
+    model: str,
+    lang: str,
+    annotate: bool,
+    hf_token: str | None,
+) -> Path | None:
+    """Run whisply and return the path to its JSON output."""
+    venv_bin = Path.home() / ".local" / "share" / "transcribe" / "venv" / "bin"
+    whisply_bin = venv_bin / "whisply"
+
+    cmd = [
+        str(whisply_bin), "run",
+        "-f", str(audio_path),
+        "-o", str(output_dir),
+        "-d", "mlx",
+        "-m", model,
+        "-l", lang,
+        "-e", "json",
+    ]
+
+    if annotate:
+        cmd.append("-a")
+        if hf_token:
+            cmd.extend(["-hf", hf_token])
+
+    print(f"Model: {model}")
+    if annotate:
+        print("Running transcription with speaker annotation…")
+    else:
+        print("Running transcription…")
+
+    env = {**os.environ, "NO_COLOR": "1"}
+    result = subprocess.run(cmd, cwd=str(output_dir), env=env)
+
+    if result.returncode != 0:
+        print("Error: whisply exited with an error.", file=sys.stderr)
+        return None
+
+    return find_whisply_output(output_dir, audio_path.stem)
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe audio to Markdown using Whisper on Apple Silicon.",
+        prog="transcribe",
+        description="Transcribe audio to Markdown using whisply on Apple Silicon.",
     )
     parser.add_argument("audio_file", help="Path to audio file (.m4a, .mp3, .wav, .flac)")
     parser.add_argument(
         "--speakerid",
         action="store_true",
-        help="Label individual speakers (requires pyannote.audio + HuggingFace token)",
+        help="Label individual speakers (requires HuggingFace token)",
     )
     parser.add_argument(
         "--turbo",
@@ -232,6 +193,15 @@ def main():
     parser.add_argument(
         "-o", "--output",
         help="Output .md path (default: <input_name>.md in the same directory)",
+    )
+    parser.add_argument(
+        "--lang",
+        default="en",
+        help="Language code, e.g. en, de, fr (default: en; skips auto-detection)",
+    )
+    parser.add_argument(
+        "--hf-token",
+        help="HuggingFace access token (for --speakerid; or use hf auth login)",
     )
 
     args = parser.parse_args()
@@ -246,9 +216,48 @@ def main():
         print(f"Warning: unexpected format {audio_path.suffix}; trying anyway…", file=sys.stderr)
 
     output_path = Path(args.output) if args.output else audio_path.with_suffix(".md")
-    model_key = "turbo" if args.turbo else "large-v3"
+    model = "large-v3-turbo" if args.turbo else "large-v3"
 
-    md = transcribe_audio(str(audio_path), model_key=model_key, speaker_id=args.speakerid)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Copy audio to temp dir with a safe filename so whisply
+        # doesn't rename the original (it renames files with spaces)
+        safe_name = audio_path.name.replace(" ", "_")
+        tmp_audio = Path(tmp_dir) / "input" / safe_name
+        tmp_audio.parent.mkdir()
+        shutil.copy2(audio_path, tmp_audio)
+
+        whisply_output_dir = Path(tmp_dir) / "output"
+        whisply_output_dir.mkdir()
+
+        json_path = run_whisply(
+            audio_path=tmp_audio,
+            output_dir=whisply_output_dir,
+            model=model,
+            lang=args.lang,
+            annotate=args.speakerid,
+            hf_token=args.hf_token,
+        )
+
+        if not json_path:
+            print("Error: could not find whisply output.", file=sys.stderr)
+            sys.exit(1)
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        # whisply nests transcription under data["transcription"][lang_code]
+        transcription = raw.get("transcription", {})
+        # Get the first (and typically only) language key
+        lang_key = next(iter(transcription), None)
+        if lang_key:
+            data = transcription[lang_key]
+        else:
+            data = raw  # fallback to top-level
+
+        if args.speakerid:
+            md = json_to_markdown_speakers(data)
+        else:
+            md = json_to_markdown_simple(data)
 
     output_path.write_text(md, encoding="utf-8")
     print(f"✓ Saved: {output_path}")
