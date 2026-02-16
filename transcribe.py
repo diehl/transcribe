@@ -216,7 +216,7 @@ def main():
         print(f"Warning: unexpected format {audio_path.suffix}; trying anyway…", file=sys.stderr)
 
     output_path = Path(args.output) if args.output else audio_path.with_suffix(".md")
-    model = "large-v3-turbo" if args.turbo else "large-v3"
+    model = "large-v3-turbo" if args.turbo else "large-v2"
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Copy audio to temp dir with a safe filename so whisply
